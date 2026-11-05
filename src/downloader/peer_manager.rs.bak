@@ -1,0 +1,436 @@
+use crate::{
+    downloader::{METAINFO, info_hash, total_length},
+    error::Error,
+};
+use std::{
+    collections::{HashMap, HashSet, hash_map::Entry},
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
+    time::{self, Instant},
+};
+use zerocopy::big_endian;
+
+const MAX_PEERS: usize = 100;
+
+struct PeerStatus {
+    choked: bool,
+    interested: bool,
+    has_pieces: Vec<bool>,
+    active: bool,
+}
+
+impl Default for PeerStatus {
+    fn default() -> Self {
+        Self {
+            choked: true,
+            interested: false,
+            has_pieces: vec![false; METAINFO.info.pieces.len()],
+            active: true,
+        }
+    }
+}
+
+// #[derive(Debug, Clone)]
+// struct Piece {
+//     piece: i32,
+//     bytes: Vec<u8>,
+// }
+
+struct PeerConnection {
+    stream: TcpStream,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    conn_counter: Arc<AtomicUsize>,
+    peers: Arc<Mutex<HashMap<SocketAddr, PeerStatus>>>,
+    need_pieces: Arc<Mutex<HashSet<i32>>>,
+    blocks: Sender<Piece>,
+}
+
+#[derive(Debug, Clone)]
+#[repr(u8)]
+enum MessageId {
+    Choke = 0,
+    Unchoke = 1,
+    Interested = 2,
+    NotInterested = 3,
+    Have = 4,
+    BitField = 5,
+    Request = 6,
+    Piece = 7,
+    Cancel = 8,
+    DHTPort = 9,
+}
+
+impl MessageId {
+    fn n(&self) -> u8 {
+        match self {
+            Self::Choke => Self::Choke as u8,
+            Self::Unchoke => Self::Unchoke as u8,
+            Self::Interested => Self::Interested as u8,
+            Self::NotInterested => Self::NotInterested as u8,
+            Self::Have => Self::Have as u8,
+            Self::BitField => Self::BitField as u8,
+            Self::Request => Self::Request as u8,
+            Self::Piece => Self::Piece as u8,
+            Self::Cancel => Self::Cancel as u8,
+            Self::DHTPort => Self::DHTPort as u8,
+        }
+    }
+
+    fn f(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Choke),
+            1 => Some(Self::Unchoke),
+            2 => Some(Self::Interested),
+            3 => Some(Self::NotInterested),
+            4 => Some(Self::Have),
+            5 => Some(Self::BitField),
+            6 => Some(Self::Request),
+            7 => Some(Self::Piece),
+            8 => Some(Self::Cancel),
+            9 => Some(Self::DHTPort),
+            _ => None,
+        }
+    }
+}
+
+impl PeerConnection {
+    async fn run(mut self) -> Result<(), Error> {
+        log::debug!("starting another peer thread");
+        self.conn_counter.fetch_add(1, Ordering::SeqCst);
+
+        self.handshake().await?;
+        self.unchoke().await.unwrap();
+
+        let mut keepalive_instant = Instant::now();
+
+        loop {
+            if keepalive_instant.elapsed() > Duration::from_secs(30) {
+                self.keepalive().await.unwrap();
+                keepalive_instant = Instant::now();
+            }
+            let mut buf = [0u8; 4];
+
+            match time::timeout(Duration::from_secs(30), self.stream.read_exact(&mut buf)).await {
+                Err(_) => continue,
+                Ok(v) => match v {
+                    Err(error) => log::warn!("peer read failed: {error}"),
+                    Ok(_) => {}
+                },
+            }
+            let len = i32::from_be_bytes(buf);
+            if len == 0 {
+                continue;
+            }
+
+            let mut buf = [0u8];
+            match time::timeout(Duration::from_secs(5), self.stream.read_exact(&mut buf)).await {
+                Err(_) => continue,
+                Ok(v) => match v {
+                    Err(error) => log::warn!("peer read failed: {error}"),
+                    Ok(_) => {}
+                },
+            }
+
+            let m = if let Some(m) = MessageId::f(buf[0]) {
+                m
+            } else {
+                continue;
+            };
+
+            match m {
+                MessageId::Choke => {
+                    let mut p = self.peers.lock().await;
+                    let entry = p.entry(self.stream.peer_addr().unwrap()).or_default();
+                    entry.choked = true;
+                }
+                MessageId::Unchoke => {
+                    let mut p = self.peers.lock().await;
+                    let entry = p.entry(self.stream.peer_addr().unwrap()).or_default();
+                    entry.choked = false;
+                }
+                MessageId::Interested => {
+                    let mut p = self.peers.lock().await;
+                    let entry = p.entry(self.stream.peer_addr().unwrap()).or_default();
+                    entry.interested = true;
+                }
+                MessageId::NotInterested => {
+                    let mut p = self.peers.lock().await;
+                    let entry = p.entry(self.stream.peer_addr().unwrap()).or_default();
+                    entry.interested = false;
+                }
+                MessageId::Have => {
+                    let mut buf = [0u8; 4];
+                    match time::timeout(Duration::from_secs(5), self.stream.read_exact(&mut buf))
+                        .await
+                    {
+                        Err(_) => continue,
+                        Ok(v) => match v {
+                            Err(error) => log::warn!("peer read failed: {error}"),
+                            Ok(_) => {}
+                        },
+                    }
+                    let piece_index = i32::from_be_bytes(buf) as usize;
+
+                    let mut p = self.peers.lock().await;
+                    let entry = p.entry(self.stream.peer_addr().unwrap()).or_default();
+                    entry.has_pieces.get_mut(piece_index).map(|x| *x = true);
+                }
+                MessageId::BitField => {
+                    let mut buf = vec![0u8; len as usize - 1]; // minus id
+                    match time::timeout(Duration::from_secs(5), self.stream.read_exact(&mut buf))
+                        .await
+                    {
+                        Err(_) => continue,
+                        Ok(v) => match v {
+                            Err(error) => log::warn!("peer read failed: {error}"),
+                            Ok(_) => {}
+                        },
+                    }
+
+                    let mut p = self.peers.lock().await;
+                    let need = self.need_pieces.lock().await;
+                    let entry = p.entry(self.stream.peer_addr().unwrap()).or_default();
+                    entry.has_pieces.iter_mut().enumerate().map(|(idx, x)| {
+                        let has = buf[idx.div_floor(8)] & (1 << (idx % 8)) != 0;
+                        *x = has;
+                        if has && need.contains(&(idx as i32)) {
+                            // todo: we want that damn piece!!
+                        }
+                    });
+                }
+                MessageId::Request => {
+                    // todo
+                    // ignore
+                }
+                MessageId::Piece => todo!(),
+                MessageId::Cancel => todo!(),
+                MessageId::DHTPort => todo!(),
+            }
+        }
+    }
+
+    async fn handshake(&mut self) -> Result<(), Error> {
+        let buf_1 = [
+            [19u8].as_slice(),
+            b"BitTorrent protocol".as_slice(),
+            [0u8; 8].as_slice(),
+            self.info_hash.as_slice(),
+            self.peer_id.as_slice(),
+        ]
+        .concat();
+
+        self.stream.write_all(&buf_1).await.unwrap();
+
+        let mut buf = [0u8; 100];
+        let received = self.stream.read(&mut buf).await.unwrap();
+        let frame = &buf[..received];
+
+        log::debug!("received from peer: {frame:?}");
+
+        if received != buf_1.len() {
+            log::warn!("peer sent smth else (sent: {frame:?}, disconnecting...");
+            self.conn_counter.fetch_sub(1, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        if frame[0] == 19 && &frame[1..(b"BitTorrent protocol").len() + 1] == b"BitTorrent protocol"
+        {
+            log::info!("good peer: {}", self.stream.peer_addr().unwrap());
+            {
+                let mut p = self.peers.lock().await;
+                let entry = p.entry(self.stream.peer_addr().unwrap());
+                match entry {
+                    Entry::Vacant(e) => {
+                        log::debug!("seeing new {}..", e.key());
+                        e.insert(PeerStatus {
+                            choked: true,
+                            interested: false,
+                            has_pieces: Vec::new(),
+                            active: true,
+                        });
+                    }
+                    Entry::Occupied(mut e) => {
+                        log::debug!("seeing again {}..", e.key());
+                        let v = e.get_mut();
+                        if v.active {
+                            // other thread also running it..
+                            return Err(Error::Internal("TODO".to_string()));
+                        }
+                        v.active = true;
+                        v.choked = true;
+                        v.interested = false;
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            log::error!("bad peer");
+            Err(Error::Internal("TODO".to_string()))
+        }
+    }
+
+    async fn handle_input(&mut self) -> Result<(), Error> {
+        // todo
+
+        let mut buf = [0u8; 4];
+        self.stream.read_exact(&mut buf).await.unwrap();
+        let len = big_endian::I32::from_bytes(buf);
+        if len == 0 {
+            // keepalive
+            return Ok(());
+        }
+
+        let mut buf = [0u8; 1];
+        self.stream.read_exact(&mut buf).await.unwrap();
+
+        let id = MessageId::f(buf[0]).unwrap();
+
+        match id {
+            MessageId::Choke => todo!(),
+        }
+
+        Ok(())
+    }
+
+    async fn keepalive(&mut self) -> Result<(), Error> {
+        self.stream.write_i32(0000).await.unwrap();
+        Ok(())
+    }
+
+    fn msg_len(msg: &[u8]) -> [u8; 4] {
+        (msg.len() as i32).to_be_bytes()
+    }
+
+    async fn choke(&mut self) -> Result<(), Error> {
+        let msg = [0u8];
+        self.stream
+            .write_all(&[Self::msg_len(&msg).as_slice(), &msg].concat())
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    async fn unchoke(&mut self) -> Result<(), Error> {
+        let msg = [1u8];
+        self.stream
+            .write_all(&[Self::msg_len(&msg).as_slice(), &msg].concat())
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    async fn interested(&mut self) -> Result<(), Error> {
+        let msg = [2u8];
+        self.stream
+            .write_all(&[Self::msg_len(&msg).as_slice(), &msg].concat())
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    async fn not_interested(&mut self) -> Result<(), Error> {
+        let msg = [3u8];
+        self.stream
+            .write_all(&[Self::msg_len(&msg).as_slice(), &msg].concat())
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    // async fn choke(&mut self) -> Result<(), Error> {
+    //     self.stream
+    //         .write_all(&[0u8, 0u8, 0u8, 1u8, 0u8])
+    //         .await
+    //         .unwrap();
+    //     Ok(())
+    // }
+}
+
+struct Piece {
+    index: usize,
+    bytes: Vec<u8>,
+    check_hash: [u8; 20],
+}
+
+pub async fn run(peer_id: [u8; 20], mut rx: Receiver<SocketAddr>) -> Result<(), Error> {
+    let required_pieces = Arc::new(Mutex::new(vec![false; METAINFO.info.pieces.len()]));
+    let connections = Arc::new(AtomicUsize::new(0));
+
+    Ok(())
+    // let need_pieces = Arc::new(AtomicBool::new(true));
+    // let conn_counter = Arc::new(AtomicUsize::new(0));
+    // let info_hash = info_hash(&METAINFO).unwrap();
+    //
+    // let peers = Arc::new(Mutex::new(HashMap::new()));
+    //
+    // let blocks = Arc::new(Mutex::new(HashMap::new()));
+    // {
+    //     let length = METAINFO.info.piece_length;
+    //     let mut b = blocks.lock().await;
+    //     for (idx, t_file) in METAINFO.info.files.files.iter().enumerate() {
+    //         b.insert(
+    //             idx as i32,
+    //             vec![false; t_file.length.div_ceil(length) as usize],
+    //         );
+    //     }
+    // }
+    //
+    // let mut file = File::create("temp").await.unwrap();
+    // file.set_len(total_length(&METAINFO).unwrap() as u64)
+    //     .await
+    //     .unwrap();
+    //
+    // let (b_tx, mut b_rx) = mpsc::channel::<Block>(100);
+    //
+    // tokio::spawn(async move {
+    //     while let Some(block) = b_rx.recv().await {
+    //         let start =
+    //             ((METAINFO.info.piece_length as u64) * block.piece as u64) + block.start as u64;
+    //         file.seek(std::io::SeekFrom::Start(start)).await.unwrap();
+    //         file.write_all(&block.bytes).await.unwrap();
+    //         log::debug!("written another block: {block:?}");
+    //     }
+    //
+    //     log::info!("all peers stopped");
+    // });
+    //
+    // loop {
+    //     if !need_pieces.load(Ordering::SeqCst) {
+    //         return Ok(());
+    //     }
+    //     if conn_counter.load(Ordering::SeqCst) < MAX_PEERS {
+    //         let peer_socket = match rx.recv().await {
+    //             Some(s) => s,
+    //             None => return Ok(()),
+    //         };
+    //
+    //         let stream = TcpStream::connect(peer_socket).await.unwrap();
+    //         let connection = PeerConnection {
+    //             stream,
+    //             peer_id,
+    //             info_hash,
+    //             conn_counter: Arc::clone(&conn_counter),
+    //             peers: Arc::clone(&peers),
+    //             blocks: b_tx.clone(),
+    //             am_choking: true,
+    //             am_interested: false,
+    //         };
+    //
+    //         tokio::spawn(connection.run());
+    //     }
+    // }
+}

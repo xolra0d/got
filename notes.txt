@@ -1,0 +1,2 @@
+check peer_id from tracker and from peer
+

@@ -1,0 +1,212 @@
+use core::fmt::NumBuffer;
+use std::{collections::HashMap, fmt::Debug, hash::Hash, io, io::Write};
+
+#[derive(Debug, Clone)]
+pub struct BencodeInteger(i64);
+
+#[derive(Debug, Clone)]
+pub struct BencodeString(Vec<u8>);
+
+#[derive(Debug, Clone)]
+pub struct BencodeList<T>(Vec<T>)
+where
+    T: ToBencode;
+
+#[derive(Debug, Clone)]
+pub struct Dictionary(HashMap<BencodeString, Value>);
+
+pub trait ToBencode {
+    fn to_bencode(&self, out: &mut impl Write) -> Result<(), io::Error>;
+}
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    Integer(BencodeInteger),
+    String(BencodeString),
+    List(Vec<Value>),
+    Dictionary(Dictionary),
+}
+
+impl ToBencode for Value {
+    fn to_bencode(&self, out: &mut impl Write) -> Result<(), io::Error> {
+        match self {
+            Self::Integer(val) => val.to_bencode(out),
+            Self::String(val) => val.to_bencode(out),
+            Self::List(val) => val.to_bencode(out),
+            Self::Dictionary(val) => val.to_bencode(out),
+        }
+    }
+}
+
+impl ToBencode for BencodeInteger {
+    fn to_bencode(&self, out: &mut impl Write) -> Result<(), io::Error> {
+        out.write_all(b"i")?;
+        let mut buf = NumBuffer::new();
+        out.write_all(self.0.format_into(&mut buf).as_bytes())?;
+        out.write_all(b"e")
+    }
+}
+
+impl BencodeString {
+    fn new() -> BencodeString {
+        BencodeString(Vec::new())
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for BencodeString {
+    fn from(value: &[u8; N]) -> Self {
+        BencodeString(value.to_vec())
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for BencodeString {
+    fn from(value: [u8; N]) -> Self {
+        BencodeString(value.to_vec())
+    }
+}
+
+impl From<&[u8]> for BencodeString {
+    fn from(value: &[u8]) -> Self {
+        BencodeString(value.to_vec())
+    }
+}
+
+impl Write for BencodeString {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
+}
+
+impl ToBencode for BencodeString {
+    fn to_bencode(&self, out: &mut impl Write) -> Result<(), io::Error> {
+        let len = self.0.len();
+        let mut buf = NumBuffer::new();
+        out.write_all(len.format_into(&mut buf).as_bytes())?;
+        out.write_all(b":")?;
+        out.write_all(&self.0)
+    }
+}
+
+impl PartialEq for BencodeString {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Hash for BencodeString {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl Eq for BencodeString {}
+
+impl Dictionary {
+    fn new() -> Dictionary {
+        Dictionary(HashMap::new())
+    }
+
+    fn insert(&mut self, key: BencodeString, value: Value) {
+        self.0.insert(key, value);
+    }
+
+    // fn get(&self, key: BencodeString,
+}
+
+impl ToBencode for Dictionary {
+    fn to_bencode(&self, out: &mut impl Write) -> Result<(), io::Error> {
+        let mut keys: Vec<&BencodeString> = self.0.keys().collect();
+        keys.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        out.write_all(b"d")?;
+
+        for k in keys {
+            let Some(val) = self.0.get(k) else {
+                panic!("KEY disappeared from dictionary! Key: {k:?}");
+            };
+            k.to_bencode(out)?;
+            val.to_bencode(out)?;
+        }
+
+        out.write_all(b"e")
+    }
+}
+
+impl<T: ToBencode> ToBencode for BencodeList<T> {
+    fn to_bencode(&self, out: &mut impl Write) -> Result<(), io::Error> {
+        out.write_all(b"l")?;
+        for el in &self.0 {
+            el.to_bencode(out)?;
+        }
+        out.write_all(b"e")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_strings() {
+        let empty: BencodeString = BencodeString::new();
+        let mut buf: Vec<u8> = Vec::new();
+        empty.to_bencode(&mut buf).unwrap();
+        assert_eq!(buf, b"0:");
+
+        let spam = BencodeString::from(b"spam");
+        let mut buf: Vec<u8> = Vec::new();
+        spam.to_bencode(&mut buf).unwrap();
+        assert_eq!(buf, b"4:spam");
+
+        let empty = BencodeString::from(b"Testing 123. Testing");
+        let mut buf: Vec<u8> = Vec::new();
+        empty.to_bencode(&mut buf).unwrap();
+        assert_eq!(buf, b"20:Testing 123. Testing");
+    }
+
+    #[test]
+    #[allow(clippy::zero_prefixed_literal)]
+    fn encodes_integers() {
+        let mut buf: Vec<u8> = Vec::new();
+        BencodeInteger(0).to_bencode(&mut buf).unwrap();
+        assert_eq!(buf, b"i0e");
+
+        let mut buf: Vec<u8> = Vec::new();
+        BencodeInteger(-123123214532593)
+            .to_bencode(&mut buf)
+            .unwrap();
+        assert_eq!(buf, b"i-123123214532593e");
+
+        let mut buf: Vec<u8> = Vec::new();
+        BencodeInteger(057274942974).to_bencode(&mut buf).unwrap();
+        assert_eq!(buf, b"i57274942974e");
+
+        let mut buf: Vec<u8> = Vec::new();
+        BencodeInteger(123123214532593)
+            .to_bencode(&mut buf)
+            .unwrap();
+        BencodeInteger(06324624728428).to_bencode(&mut buf).unwrap();
+        assert_eq!(buf, b"i123123214532593ei6324624728428e");
+    }
+
+    #[test]
+    fn encodes_lists() {
+        let spam = vec![BencodeString::from(b"spam")];
+        let mut buf = Vec::new();
+        spam.to_bencode(&mut buf).unwrap();
+        assert_eq!(buf, b"l4:spame");
+
+        let spam = vec![BencodeString::from(b"spam"), BencodeString::from(b"eggs")];
+        let mut buf = Vec::new();
+        spam.to_bencode(&mut buf).unwrap();
+        assert_eq!(buf, b"l4:spam4:eggse");
+
+        let spam: Vec<BencodeString> = Vec::new();
+        let mut buf = Vec::new();
+        spam.to_bencode(&mut buf).unwrap();
+        assert_eq!(buf, b"le");
+    }
+}
